@@ -309,6 +309,42 @@ class Asar:
 
         self._extract_directory('.', self.header['files'], path)
 
+    def save(self, path):
+        """Saves this asar file to ``path``.
+
+        This is useful when you've created an asar from a directory
+        using :meth:`.from_path` and want to write it to disk.
+
+        Parameters
+        ----------
+        path : str
+            Destination path to save the asar file.
+        """
+        self.fp.seek(0)
+        with open(path, 'wb') as f:
+            f.write(self.fp.read())
+
+    @classmethod
+    def pack(cls, source_dir, dest_path):
+        """Packs a directory into an asar file and saves it to disk.
+
+        This is a convenience method that combines :meth:`.from_path`
+        and :meth:`.save`.
+
+        .. code-block:: python
+
+            Asar.pack('./my_folder', './my_folder.asar')
+
+        Parameters
+        ----------
+        source_dir : str
+            Path to the directory to pack.
+        dest_path : str
+            Path where the asar file will be saved.
+        """
+        with cls.from_path(source_dir) as a:
+            a.save(dest_path)
+
     def __enter__(self):
         return self
 
