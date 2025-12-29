@@ -2,14 +2,15 @@
 使用方法: python main.py <飞书安装根目录>
 """
 import sys
+import re
 import shutil
 from typing import Optional, List, Tuple
 from pathlib import Path
 from asar import Asar
 
 
-CODE_PIECE = b'info("updateMessagesMeRead",'
-PAYLOAD = b"t.messageIds = [];"
+CODE_PATTERN = re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"')
+PAYLOAD = b"t.messageIds=[],"
 
 UNPACKED_DIR = Path(__file__).parent / "unpacked"
 
@@ -32,7 +33,8 @@ def unpack_asar(asar_file: Path):
 
 def find_file(search_dir: Path) -> List[Tuple[Path, int]]:
     """
-    搜索要修改的 js 文件
+    搜索要修改的 js 文件，返回 (文件路径, 插入位置) 列表
+    插入位置是 x.Y.info("updateMessagesMeRead" 中变量名的起始位置
     """
     all_js_files = list(search_dir.rglob("*.js"))
     result = []
@@ -42,12 +44,9 @@ def find_file(search_dir: Path) -> List[Tuple[Path, int]]:
                 content = f.read()
             except UnicodeDecodeError:
                 continue
-            try:
-                offset = content.index(CODE_PIECE)
-                lst_return_offset = content.rindex(b"return ", 0, offset)
-                result.append((js_file, lst_return_offset))
-            except ValueError:
-                continue
+            match = CODE_PATTERN.search(content)
+            if match:
+                result.append((js_file, match.start()))
 
     return result
 
@@ -55,9 +54,10 @@ def find_file(search_dir: Path) -> List[Tuple[Path, int]]:
 def make_backup(asar_file: Path):
     bak_file = asar_file.with_suffix(".asar.bak")
     if bak_file.exists():
+        print(f"备份文件已存在：{bak_file}")
         return
-    print(f"重命名/备份原始 asar 文件：{asar_file} -> {bak_file}")
-    shutil.move(asar_file, bak_file)
+    print(f"备份原始 asar 文件：{asar_file} -> {bak_file}")
+    shutil.copy2(asar_file, bak_file)
 
 
 def modify_file(js_file: Path, offset: int):
@@ -79,21 +79,31 @@ def main():
     if not asar_file:
         print("未找到 messenger.asar，可能是飞书安装目录指定的不正确，或版本不兼容", file=sys.stderr)
         exit(1)
-    if asar_file.is_dir():
-        print("似乎文件已经修改过了。若要重新执行，请先将 `messenger.asar` 目录删除，并将 `messenger.asar.bak` 重命名回 `messenger.asar`", file=sys.stderr)
+    bak_file = asar_file.with_suffix(".asar.bak")
+    if bak_file.exists():
+        print(f"检测到备份文件 {bak_file}，似乎已经修改过了。若要重新执行，请先将 `messenger.asar.bak` 重命名回 `messenger.asar`", file=sys.stderr)
         exit(1)
 
-    unpack_asar(asar_file)
     make_backup(asar_file)
+    unpack_asar(asar_file)
 
     js_files = find_file(UNPACKED_DIR)
+    if not js_files:
+        print("未找到需要修改的代码，可能是版本不兼容", file=sys.stderr)
+        shutil.rmtree(UNPACKED_DIR)
+        exit(1)
+
     for js_file, offset in js_files:
         modify_file(js_file, offset)
 
-    # 不需要重新打包，只需保证目录名与原 asar 文件名一致即可
-    shutil.move(UNPACKED_DIR, asar_file)
+    # 打包回 asar 文件
+    print(f"正在打包：{UNPACKED_DIR} -> {asar_file}")
+    Asar.pack(UNPACKED_DIR, asar_file)
 
-    print("修改完成。请重启飞书。若飞书功能异常，请将删除 `messenger.asar` 目录，并将 `messenger.asar.bak` 重命名回 `messenger.asar`")
+    # 清理临时目录
+    shutil.rmtree(UNPACKED_DIR)
+
+    print("修改完成。请重启飞书。若飞书功能异常，请将 `messenger.asar.bak` 重命名回 `messenger.asar`")
 
 
 
