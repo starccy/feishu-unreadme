@@ -4,13 +4,25 @@
 import sys
 import re
 import shutil
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Pattern, Dict
 from pathlib import Path
 from asar import Asar
 
 
-CODE_PATTERN = re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"')
-PAYLOAD = b"t.messageIds=[],"
+PATCHES = [
+    # (pattern, payload) 列表;每组 pattern 必须在解包目录中恰好命中至少一处,
+    # 否则视为版本不兼容并退出。payload 是一段 JS 字节串,会被插入到 pattern
+    # 匹配位置的开头(变量名起始处)。因为锚点都位于表达式参数列表中,所以
+    # payload 必须是表达式(末尾用 `,`),不能是 statement。
+    (
+        re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"'),
+        b"(window.__feishuAllowMeReadCount>0?window.__feishuAllowMeReadCount--:t.messageIds=[]),",
+    ),
+    (
+        re.compile(rb'\w+\.\w+\.info\("MessageService::sendMessage:onSendMessageSuccess:"'),
+        b"window.__feishuAllowMeReadCount=1,",
+    ),
+]
 
 UNPACKED_DIR = Path(__file__).parent / "unpacked"
 
@@ -31,23 +43,21 @@ def unpack_asar(asar_file: Path):
         archive.extract(UNPACKED_DIR)
 
 
-def find_file(search_dir: Path) -> List[Tuple[Path, int]]:
+def find_file(search_dir: Path, patches: List[Tuple[Pattern[bytes], bytes]]) -> Dict[Path, List[Tuple[int, bytes]]]:
     """
-    搜索要修改的 js 文件，返回 (文件路径, 插入位置) 列表
-    插入位置是 x.Y.info("updateMessagesMeRead" 中变量名的起始位置
+    对每个 (pattern, payload),在 search_dir 下所有 .js 文件中搜索锚点。
+    返回 {js_file: [(offset, payload), ...]}。同一文件可能有多个锚点。
     """
+    result: dict = {}
     all_js_files = list(search_dir.rglob("*.js"))
-    result = []
     for js_file in all_js_files:
-        with open(js_file, 'rb') as f:
-            try:
-                content = f.read()
-            except UnicodeDecodeError:
-                continue
-            match = CODE_PATTERN.search(content)
-            if match:
-                result.append((js_file, match.start()))
-
+        try:
+            content = js_file.read_bytes()
+        except OSError:
+            continue
+        for pattern, payload in patches:
+            for match in pattern.finditer(content):
+                result.setdefault(js_file, []).append((match.start(), payload))
     return result
 
 
@@ -60,13 +70,20 @@ def make_backup(asar_file: Path):
     shutil.copy2(asar_file, bak_file)
 
 
-def modify_file(js_file: Path, offset: int):
-    print(f"正在修改文件：{js_file}")
+def modify_file(js_file: Path, anchors: List[Tuple[int, bytes]]) -> None:
+    """
+    在 js_file 中按 offset 倒序插入多个 payload,避免后续 offset 失效。
+    anchors: List[Tuple[int, bytes]],元素为 (offset, payload)。
+    """
+    print(f"正在修改文件：{js_file}({len(anchors)} 处锚点)")
     with open(js_file, "rb+") as f:
         content = f.read()
-        f.seek(offset)
-        f.write(PAYLOAD)
-        f.write(content[offset:])
+        # 倒序:先在大 offset 处插入,小 offset 不受影响
+        for offset, payload in sorted(anchors, key=lambda x: -x[0]):
+            content = content[:offset] + payload + content[offset:]
+        f.seek(0)
+        f.truncate()
+        f.write(content)
 
 
 def main():
@@ -87,14 +104,19 @@ def main():
     make_backup(asar_file)
     unpack_asar(asar_file)
 
-    js_files = find_file(UNPACKED_DIR)
-    if not js_files:
-        print("未找到需要修改的代码，可能是版本不兼容", file=sys.stderr)
+    files_map = find_file(UNPACKED_DIR, PATCHES)
+
+    # 每个 pattern 都至少命中一次,才认为版本兼容
+    covered_payloads = {payload for anchors in files_map.values() for _, payload in anchors}
+    expected_payloads = {payload for _, payload in PATCHES}
+    missing = expected_payloads - covered_payloads
+    if missing:
+        print(f"未找到 {len(missing)} 组锚点,可能是版本不兼容", file=sys.stderr)
         shutil.rmtree(UNPACKED_DIR)
         exit(1)
 
-    for js_file, offset in js_files:
-        modify_file(js_file, offset)
+    for js_file, anchors in files_map.items():
+        modify_file(js_file, anchors)
 
     # 打包回 asar 文件
     print(f"正在打包：{UNPACKED_DIR} -> {asar_file}")
