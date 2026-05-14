@@ -18,6 +18,10 @@ PATCHES = [
         re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"'),
         b"(window.__feishuAllowMeReadCount>0?window.__feishuAllowMeReadCount--:t.messageIds=[]),",
     ),
+    (
+        re.compile(rb'\w+\.\w+\.info\("MessageService::sendMessage:onSendMessageSuccess:"'),
+        b"window.__feishuAllowMeReadCount=1,",
+    ),
 ]
 
 UNPACKED_DIR = Path(__file__).parent / "unpacked"

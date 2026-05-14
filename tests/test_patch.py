@@ -121,5 +121,43 @@ class MultiAnchorTests(unittest.TestCase):
         )
 
 
+class TwoAnchorIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_both_real_patches_apply(self):
+        js = (
+            b'function reader(){a.b.info("updateMessagesMeRead",t.messageIds);}\n'
+            b'function sender(){c.d.info("MessageService::sendMessage:onSendMessageSuccess:",t,s);}\n'
+        )
+        p = self.tmpdir / "a.js"
+        p.write_bytes(js)
+
+        files_map = main.find_file(self.tmpdir, main.PATCHES)
+        self.assertIn(p, files_map)
+        anchors = files_map[p]
+        self.assertEqual(len(anchors), 2)
+
+        main.modify_file(p, anchors)
+        modified = p.read_bytes()
+
+        for _, payload in main.PATCHES:
+            self.assertIn(payload, modified)
+
+        idx1 = modified.index(b'a.b.info("updateMessagesMeRead"')
+        self.assertEqual(
+            modified[idx1 - len(main.PATCHES[0][1]):idx1],
+            main.PATCHES[0][1],
+        )
+        idx2 = modified.index(b'c.d.info("MessageService::sendMessage:onSendMessageSuccess:"')
+        self.assertEqual(
+            modified[idx2 - len(main.PATCHES[1][1]):idx2],
+            main.PATCHES[1][1],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
