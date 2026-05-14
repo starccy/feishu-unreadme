@@ -4,7 +4,7 @@
 import sys
 import re
 import shutil
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Pattern, Dict
 from pathlib import Path
 from asar import Asar
 
@@ -39,7 +39,7 @@ def unpack_asar(asar_file: Path):
         archive.extract(UNPACKED_DIR)
 
 
-def find_file(search_dir: Path, patches) -> dict:
+def find_file(search_dir: Path, patches: List[Tuple[Pattern[bytes], bytes]]) -> Dict[Path, List[Tuple[int, bytes]]]:
     """
     对每个 (pattern, payload),在 search_dir 下所有 .js 文件中搜索锚点。
     返回 {js_file: [(offset, payload), ...]}。同一文件可能有多个锚点。
@@ -49,7 +49,7 @@ def find_file(search_dir: Path, patches) -> dict:
     for js_file in all_js_files:
         try:
             content = js_file.read_bytes()
-        except (OSError, UnicodeDecodeError):
+        except OSError:
             continue
         for pattern, payload in patches:
             for match in pattern.finditer(content):
@@ -66,7 +66,7 @@ def make_backup(asar_file: Path):
     shutil.copy2(asar_file, bak_file)
 
 
-def modify_file(js_file: Path, anchors):
+def modify_file(js_file: Path, anchors: List[Tuple[int, bytes]]) -> None:
     """
     在 js_file 中按 offset 倒序插入多个 payload,避免后续 offset 失效。
     anchors: List[Tuple[int, bytes]],元素为 (offset, payload)。
