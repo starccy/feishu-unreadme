@@ -5,8 +5,12 @@ import io
 import os
 import json
 import errno
+import hashlib
 import struct
 import shutil
+
+
+INTEGRITY_BLOCK_SIZE = 4 * 1024 * 1024
 
 
 def round_up(i, m):
@@ -114,15 +118,29 @@ class Asar:
                         'link': os.path.realpath(f.name)
                     }
                 else:
-                    size = f.stat().st_size
+                    with open(f.path, 'rb') as file_pointer:
+                        file_content = file_pointer.read()
+
+                    size = len(file_content)
+                    blocks = [
+                        hashlib.sha256(
+                            file_content[start:start + INTEGRITY_BLOCK_SIZE]
+                        ).hexdigest()
+                        for start in range(0, size, INTEGRITY_BLOCK_SIZE)
+                    ]
 
                     result['files'][f.name] = {
                         'size': size,
-                        'offset': str(offset)
+                        'offset': str(offset),
+                        'integrity': {
+                            'algorithm': 'SHA256',
+                            'hash': hashlib.sha256(file_content).hexdigest(),
+                            'blockSize': INTEGRITY_BLOCK_SIZE,
+                            'blocks': blocks,
+                        },
                     }
 
-                    with open(f.path, 'rb') as fp:
-                        concatenated_files += fp.read()
+                    concatenated_files += file_content
 
                     offset += size
 

@@ -1,16 +1,53 @@
 """
-使用方法: python main.py <飞书安装根目录>
+使用方法: python main.py <飞书安装根目录> [--repatch]
 """
+import argparse
 import sys
 import re
 import shutil
-from typing import Optional, List, Tuple
+from typing import Dict, List, NamedTuple, Optional, Pattern, Sequence, Tuple
 from pathlib import Path
 from asar import Asar
 
 
-CODE_PATTERN = re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"')
-PAYLOAD = b"t.messageIds=[],"
+READ_RECEIPT_WINDOW_MS = 1500
+
+
+class Patch(NamedTuple):
+    name: str
+    pattern: Pattern[bytes]
+    payload: bytes
+
+
+PATCHES = (
+    Patch(
+        name="read-receipt-gate",
+        pattern=re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"'),
+        payload=(
+            b"((p=window.__feishuUnreadmePermit,n=Date.now())=>{"
+            b"if(p&&p.chatId===t.channel?.id&&p.expiresAt>=n&&p.remaining>0){"
+            b"--p.remaining<=0&&(window.__feishuUnreadmePermit=null)"
+            b"}else{t.messageIds=[],t.foldIds=[],t.maxPosition=-1,"
+            b"t.maxPositionBadgeCount=0,t.threadId=t.threadMaxPosition="
+            b"t.threadMaxPositionBadgeCount=void 0,p&&p.expiresAt<n&&"
+            b"(window.__feishuUnreadmePermit=null)}})(),"
+        ),
+    ),
+    Patch(
+        name="send-success-permit",
+        pattern=re.compile(
+            rb'\w+\.\w+\.info\("MessageService::sendMessage:onSendMessageSuccess:"'
+        ),
+        payload=(
+            "window.__feishuUnreadmePermit=this.feedId?{chatId:this.feedId,"
+            "expiresAt:Date.now()+%d,remaining:1}:null,"
+            % READ_RECEIPT_WINDOW_MS
+        ).encode("ascii"),
+    ),
+)
+
+Anchor = Tuple[int, Patch]
+PatchMap = Dict[Path, List[Anchor]]
 
 UNPACKED_DIR = Path(__file__).parent / "unpacked"
 
@@ -31,24 +68,31 @@ def unpack_asar(asar_file: Path):
         archive.extract(UNPACKED_DIR)
 
 
-def find_file(search_dir: Path) -> List[Tuple[Path, int]]:
+def find_file(search_dir: Path, patches: Sequence[Patch] = PATCHES) -> PatchMap:
     """
-    搜索要修改的 js 文件，返回 (文件路径, 插入位置) 列表
-    插入位置是 x.Y.info("updateMessagesMeRead" 中变量名的起始位置
+    搜索所有补丁锚点，返回 {文件路径: [(插入位置, 补丁), ...]}。
     """
     all_js_files = list(search_dir.rglob("*.js"))
-    result = []
+    result: PatchMap = {}
     for js_file in all_js_files:
-        with open(js_file, 'rb') as f:
-            try:
-                content = f.read()
-            except UnicodeDecodeError:
-                continue
-            match = CODE_PATTERN.search(content)
-            if match:
-                result.append((js_file, match.start()))
+        try:
+            content = js_file.read_bytes()
+        except OSError:
+            continue
+        for patch in patches:
+            for match in patch.pattern.finditer(content):
+                result.setdefault(js_file, []).append((match.start(), patch))
 
     return result
+
+
+def find_missing_patches(
+    patch_map: PatchMap, patches: Sequence[Patch] = PATCHES
+) -> List[Patch]:
+    matched_names = {
+        patch.name for anchors in patch_map.values() for _, patch in anchors
+    }
+    return [patch for patch in patches if patch.name not in matched_names]
 
 
 def make_backup(asar_file: Path):
@@ -60,48 +104,74 @@ def make_backup(asar_file: Path):
     shutil.copy2(asar_file, bak_file)
 
 
-def modify_file(js_file: Path, offset: int):
-    print(f"正在修改文件：{js_file}")
+def modify_file(js_file: Path, anchors: Sequence[Anchor]):
+    patch_names = ", ".join(patch.name for _, patch in anchors)
+    print(f"正在修改文件：{js_file}（{patch_names}）")
     with open(js_file, "rb+") as f:
         content = f.read()
-        f.seek(offset)
-        f.write(PAYLOAD)
-        f.write(content[offset:])
+        for offset, patch in sorted(anchors, key=lambda anchor: anchor[0], reverse=True):
+            content = content[:offset] + patch.payload + content[offset:]
+        f.seek(0)
+        f.truncate()
+        f.write(content)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="修改飞书客户端的已读回执逻辑")
+    parser.add_argument("install_dir", help="飞书安装根目录")
+    parser.add_argument(
+        "--repatch",
+        action="store_true",
+        help="使用已有的原始备份重新生成补丁",
+    )
+    return parser.parse_args()
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("请指定飞书安装目录", file=sys.stderr)
-        exit(1)
-
-    install_dir = sys.argv[1]
+    args = parse_args()
+    install_dir = args.install_dir
     asar_file = find_asar_file(install_dir)
     if not asar_file:
         print("未找到 messenger.asar，可能是飞书安装目录指定的不正确，或版本不兼容", file=sys.stderr)
         exit(1)
     bak_file = asar_file.with_suffix(".asar.bak")
-    if bak_file.exists():
+    if bak_file.exists() and not args.repatch:
         print(f"检测到备份文件 {bak_file}，似乎已经修改过了。若要重新执行，请先将 `messenger.asar.bak` 重命名回 `messenger.asar`", file=sys.stderr)
         exit(1)
-
-    make_backup(asar_file)
-    unpack_asar(asar_file)
-
-    js_files = find_file(UNPACKED_DIR)
-    if not js_files:
-        print("未找到需要修改的代码，可能是版本不兼容", file=sys.stderr)
-        shutil.rmtree(UNPACKED_DIR)
+    if args.repatch and not bak_file.exists():
+        print("未找到原始备份，无法使用 --repatch", file=sys.stderr)
         exit(1)
 
-    for js_file, offset in js_files:
-        modify_file(js_file, offset)
+    source_asar_file = bak_file if args.repatch else asar_file
+    if args.repatch:
+        print(f"使用原始备份重新生成补丁：{source_asar_file}")
 
-    # 打包回 asar 文件
-    print(f"正在打包：{UNPACKED_DIR} -> {asar_file}")
-    Asar.pack(UNPACKED_DIR, asar_file)
+    temp_asar_file = asar_file.with_name(f"{asar_file.name}.tmp")
+    try:
+        unpack_asar(source_asar_file)
 
-    # 清理临时目录
-    shutil.rmtree(UNPACKED_DIR)
+        patch_map = find_file(UNPACKED_DIR)
+        missing_patches = find_missing_patches(patch_map)
+        if missing_patches:
+            missing_names = ", ".join(patch.name for patch in missing_patches)
+            print(f"未找到补丁锚点：{missing_names}，可能是版本不兼容", file=sys.stderr)
+            exit(1)
+
+        for js_file, anchors in patch_map.items():
+            modify_file(js_file, anchors)
+
+        print(f"正在打包：{UNPACKED_DIR} -> {temp_asar_file}")
+        Asar.pack(UNPACKED_DIR, temp_asar_file)
+        with Asar.open(temp_asar_file):
+            pass
+
+        make_backup(asar_file)
+        temp_asar_file.replace(asar_file)
+    finally:
+        if UNPACKED_DIR.exists():
+            shutil.rmtree(UNPACKED_DIR)
+        if temp_asar_file.exists():
+            temp_asar_file.unlink()
 
     print("修改完成。请重启飞书。若飞书功能异常，请将 `messenger.asar.bak` 重命名回 `messenger.asar`")
 
