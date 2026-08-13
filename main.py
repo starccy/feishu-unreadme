@@ -11,6 +11,7 @@ from asar import Asar
 
 
 READ_RECEIPT_WINDOW_MS = 1500
+READ_STATE_PLACEHOLDER = b"__FEISHU_UNREADME_STATE__"
 
 
 class Patch(NamedTuple):
@@ -18,19 +19,35 @@ class Patch(NamedTuple):
     pattern: Pattern[bytes]
     payload: bytes
 
+    def render(self, match: re.Match[bytes]) -> "Patch":
+        """根据锚点捕获内容生成当前命中的补丁。"""
+        if READ_STATE_PLACEHOLDER not in self.payload:
+            return self
+
+        read_state = match.group("read_state")
+        return self._replace(
+            payload=self.payload.replace(READ_STATE_PLACEHOLDER, read_state)
+        )
+
 
 PATCHES = (
     Patch(
         name="read-receipt-gate",
-        pattern=re.compile(rb'\w+\.\w+\.info\("updateMessagesMeRead"'),
+        pattern=re.compile(
+            rb'[\w$]+\.[\w$]+\.info\("updateMessagesMeRead"'
+            rb'(?=,\(0,[\w$]+\.[\w$]+\)\(\{\.\.\.'
+            rb'(?P<read_state>[\w$]+)\},)'
+        ),
         payload=(
-            b"((p=window.__feishuUnreadmePermit,n=Date.now())=>{"
-            b"if(p&&p.chatId===t.channel?.id&&p.expiresAt>=n&&p.remaining>0){"
+            b"((r,p=window.__feishuUnreadmePermit,n=Date.now())=>{"
+            b"if(p&&p.chatId===r.channel?.id&&p.expiresAt>=n&&p.remaining>0){"
             b"--p.remaining<=0&&(window.__feishuUnreadmePermit=null)"
-            b"}else{t.messageIds=[],t.foldIds=[],t.maxPosition=-1,"
-            b"t.maxPositionBadgeCount=0,t.threadId=t.threadMaxPosition="
-            b"t.threadMaxPositionBadgeCount=void 0,p&&p.expiresAt<n&&"
-            b"(window.__feishuUnreadmePermit=null)}})(),"
+            b"}else{r.messageIds=[],r.foldIds=[],r.maxPosition=-1,"
+            b"r.maxPositionBadgeCount=0,r.threadId=r.threadMaxPosition="
+            b"r.threadMaxPositionBadgeCount=void 0,p&&p.expiresAt<n&&"
+            b"(window.__feishuUnreadmePermit=null)}})("
+            + READ_STATE_PLACEHOLDER
+            + b"),"
         ),
     ),
     Patch(
@@ -81,7 +98,9 @@ def find_file(search_dir: Path, patches: Sequence[Patch] = PATCHES) -> PatchMap:
             continue
         for patch in patches:
             for match in patch.pattern.finditer(content):
-                result.setdefault(js_file, []).append((match.start(), patch))
+                result.setdefault(js_file, []).append(
+                    (match.start(), patch.render(match))
+                )
 
     return result
 
